@@ -12,15 +12,18 @@ short_description: My own shakespeare LLM
 
 # GPT Text Generation App
 
-This is a simple text generation app using a custom GPT model. Enter a prompt, adjust the generation parameters, and see what the model creates!
+A simple text generation app using a custom GPT model trained on Shakespeare's works. Enter a prompt, adjust the generation parameters, and see what the model creates!
 
-## Parameters
-
-- **Maximum New Tokens**: Controls how many new tokens the model will generate.
-- **Temperature**: Controls randomness. Higher values (e.g., 1.5) make output more random, lower values (e.g., 0.2) make it more focused and deterministic.
-- **Top-k**: Limits the next token selection to the k most likely tokens.
-- **Number of Sequences**: Generate multiple different outputs for the same prompt.
+![Training Log](./training-logs.png)
+![Hugging Face Demo](./huggingface-demo.png)
 
 ## Model
 
-This app uses a custom GPT model trained on [describe your dataset here]. 
+This app uses a custom GPT model trained for 50 epochs, achieving a final loss of 0.1. The model has learned to generate text in a Shakespearean style.
+
+## Parameters
+
+- **Maximum New Tokens**: Controls generation length
+- **Temperature**: Controls randomness (higher = more creative)
+- **Top-k**: Limits token selection to k most likely tokens
+- **Number of Sequences**: Generate multiple outputs for the same prompt
