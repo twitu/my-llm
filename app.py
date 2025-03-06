@@ -2,32 +2,12 @@ import os
 import torch
 import gradio as gr
 from model import GPT, GPTConfig
-import pickle
 import torch.nn.functional as F
+from train import load_checkpoint
+import time
 
 # Set device to CPU for Hugging Face deployment
 device = torch.device("cpu")
-
-
-def load_checkpoint(model, path="checkpoints", map_location=None):
-    """Load model checkpoint from file"""
-    # Look for latest checkpoint
-    checkpoint_path = os.path.join(path, "latest_checkpoint.pkl")
-
-    if not os.path.exists(checkpoint_path):
-        # Check if we're looking for best model but it doesn't exist
-        if path.endswith("/best"):
-            # Try to load from regular checkpoints instead
-            return load_checkpoint(model, "checkpoints", map_location)
-        print(f"No checkpoint found at {checkpoint_path}")
-        return None, 0, float("inf")
-
-    # Use torch.load instead of pickle.load, with map_location parameter
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Checkpoint loaded from {checkpoint_path}")
-    return model, checkpoint["epoch"], checkpoint["loss"]
 
 
 def load_tokenizer():

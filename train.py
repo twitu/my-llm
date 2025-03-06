@@ -9,6 +9,7 @@ from torch.nn import functional as F
 import argparse
 import pickle
 import tiktoken
+import io
 from tqdm import tqdm
 from model import GPT, GPTConfig
 
@@ -71,7 +72,14 @@ def save_checkpoint(model, optimizer, epoch, loss, path="checkpoints"):
         print(f"New best model with loss: {loss:.4f}")
 
 
-def load_checkpoint(model, optimizer=None, path="checkpoints", map_location=None):
+class CPU_Unpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "torch.storage" and name == "_load_from_bytes":
+            return lambda b: torch.load(io.BytesIO(b), map_location="cpu")
+        else:
+            return super().find_class(module, name)
+
+def load_checkpoint(model, optimizer=None, path="checkpoints"):
     """Load model checkpoint from file"""
     # Look for latest checkpoint
     checkpoint_path = os.path.join(path, "latest_checkpoint.pkl")
@@ -80,12 +88,11 @@ def load_checkpoint(model, optimizer=None, path="checkpoints", map_location=None
         # Check if we're looking for best model but it doesn't exist
         if path.endswith("/best"):
             # Try to load from regular checkpoints instead
-            return load_checkpoint(model, optimizer, "checkpoints", map_location)
+            return load_checkpoint(model, optimizer, "checkpoints")
         print(f"No checkpoint found at {checkpoint_path}")
         return None, 0, float("inf")
 
-    # Use torch.load instead of pickle.load, with map_location parameter
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    checkpoint = CPU_Unpickler(open(checkpoint_path, "rb")).load()
 
     model.load_state_dict(checkpoint["model_state_dict"])
 
