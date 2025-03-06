@@ -270,7 +270,7 @@ def train(
 
 
 def generate_text(model, prompt=None, max_length=100, temperature=1.0):
-    """Generate text using the trained model"""
+    """Generate text using the trained model with streaming output"""
     model.to(device)
     model.eval()
 
@@ -279,44 +279,49 @@ def generate_text(model, prompt=None, max_length=100, temperature=1.0):
     if prompt:
         tokens = enc.encode(prompt)
         x = torch.tensor(tokens).unsqueeze(0).to(device)  # Shape: [1, prompt_length]
+        # Print the prompt first
+        print(prompt, end="", flush=True)
     else:
         # Start with a single token (could be random or a special start token)
         x = torch.tensor([[50256]]).to(device)  # Usually <|endoftext|> in GPT-2
+        print("", end="", flush=True)
 
     generated_tokens = x.tolist()[0]
 
     # Set random seed for reproducibility
     torch.manual_seed(42)
 
-    # Generation progress bar
-    with tqdm(total=max_length, desc="Generating") as pbar:
-        with torch.no_grad():
-            for _ in range(max_length):
-                # Forward the model to get logits
-                logits, _ = model(x)
+    # Generation loop
+    with torch.no_grad():
+        for _ in range(max_length):
+            # Forward the model to get logits
+            logits, _ = model(x)
 
-                # Get the logits for the last token
-                logits = logits[:, -1, :] / temperature
+            # Get the logits for the last token
+            logits = logits[:, -1, :] / temperature
 
-                # Sample from the distribution
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, 1)
+            # Sample from the distribution
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, 1)
 
-                # Add the token to the sequence
-                x = torch.cat((x, next_token), dim=1)
+            # Add the token to the sequence
+            x = torch.cat((x, next_token), dim=1)
 
-                # Store the new token
-                generated_tokens.append(next_token.item())
+            # Store the new token
+            token_id = next_token.item()
+            generated_tokens.append(token_id)
 
-                # Update progress bar
-                pbar.update(1)
+            # Decode and print the new token immediately
+            token_text = enc.decode([token_id])
+            print(token_text, end="", flush=True)
 
-                # Optional: Break if end token is generated
-                if next_token.item() == 50256:  # <|endoftext|>
-                    break
+            # Optional: Break if end token is generated
+            if token_id == 50256:  # <|endoftext|>
+                break
 
-    # Decode the generated tokens
+    # Return the full generated text (already printed token by token)
     generated_text = enc.decode(generated_tokens)
+    print()  # Add a newline at the end
     return generated_text
 
 
@@ -398,9 +403,7 @@ if __name__ == "__main__":
         model = GPT(GPTConfig())
 
         # Load the best model
-        model, _, _ = load_checkpoint(
-            model, path="checkpoints/best", map_location=torch.device("cpu")
-        )
+        model, _, _ = load_checkpoint(model, path="checkpoints/best")
         if model is None:
             model, _, _ = load_checkpoint(model)
             if model is None:

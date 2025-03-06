@@ -19,14 +19,9 @@ def load_tokenizer():
         return GPT2Tokenizer.from_pretrained("gpt2")
     except:
         # Fallback to a simple character-level tokenizer if transformers isn't available
-        class SimpleTokenizer:
-            def encode(self, text):
-                return [ord(c) for c in text]
+        import tiktoken
 
-            def decode(self, tokens):
-                return "".join([chr(t) for t in tokens])
-
-        return SimpleTokenizer()
+        return tiktoken.get_encoding("gpt2")
 
 
 # Initialize model and load checkpoint
@@ -39,23 +34,25 @@ def initialize_model():
 
 # Load tokenizer
 tokenizer = load_tokenizer()
+model = initialize_model()
 
 
-# Generate text based on prompt
+# Generate text based on prompt with streaming
 def generate_text(
     prompt, max_new_tokens=50, temperature=0.8, top_k=50, num_return_sequences=1
 ):
-    model = initialize_model()
-
     # Encode the prompt
     input_ids = tokenizer.encode(prompt)
     x = torch.tensor([input_ids] * num_return_sequences, dtype=torch.long).to(device)
 
-    # Generate text
+    # Initialize the output text with the prompt
+    generated_texts = [prompt] * num_return_sequences
+
+    # Generate text token by token
     with torch.no_grad():
         for _ in range(max_new_tokens):
             # Get logits from the model
-            logits = model(x)[0]  # Assuming model returns (logits, loss) or just logits
+            logits, _ = model(x)  # Assuming model returns (logits, loss)
 
             # Take the logits at the last position
             logits = logits[:, -1, :] / temperature  # Apply temperature
@@ -75,12 +72,17 @@ def generate_text(
             # Append to the sequence
             x = torch.cat((x, next_tokens), dim=1)
 
-    # Decode the generated sequences
-    generated_texts = []
-    for i in range(num_return_sequences):
-        tokens = x[i].tolist()
-        decoded = tokenizer.decode(tokens)
-        generated_texts.append(decoded)
+            # Decode and update the generated text
+            for i in range(num_return_sequences):
+                token = next_tokens[i].item()
+                token_text = tokenizer.decode([token])
+                generated_texts[i] += token_text
+
+            # Yield the current state of all generated texts
+            yield "\n\n---\n\n".join(generated_texts)
+
+            # Add a small delay to make the streaming visible
+            time.sleep(0.05)
 
     return "\n\n---\n\n".join(generated_texts)
 
