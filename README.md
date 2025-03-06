@@ -1,3 +1,15 @@
+---
+title: My Llm
+emoji: 🌖
+colorFrom: green
+colorTo: yellow
+sdk: gradio
+sdk_version: 5.20.0
+app_file: app.py
+pinned: false
+short_description: My own shakespeare LLM
+---
+
 # GPT Text Generation App
 
 This is a simple text generation app using a custom GPT model. Enter a prompt, adjust the generation parameters, and see what the model creates!
