@@ -2,12 +2,60 @@ import os
 import torch
 import gradio as gr
 from model import GPT, GPTConfig
+from train import CPU_Unpickler
 import torch.nn.functional as F
-from train import load_checkpoint
 import time
+from huggingface_hub import hf_hub_download
 
 # Set device to CPU for Hugging Face deployment
 device = torch.device("cpu")
+
+# Hugging Face model repository information
+HF_USERNAME = "twitu"  # Replace with your actual username
+HF_MODEL_REPO = "my-llm-model"
+CHECKPOINT_FILENAME = "latest_checkpoint.pkl"
+
+
+def download_model_from_hub():
+    """Download the model checkpoint from Hugging Face Hub"""
+    os.makedirs("checkpoints", exist_ok=True)
+    checkpoint_path = os.path.join("checkpoints", CHECKPOINT_FILENAME)
+
+    # Skip download if file already exists
+    if os.path.exists(checkpoint_path):
+        print(f"Using existing checkpoint at {checkpoint_path}")
+        return checkpoint_path
+
+    print(f"Downloading model from {HF_USERNAME}/{HF_MODEL_REPO}...")
+    try:
+        # Download the checkpoint file from Hugging Face Hub
+        downloaded_path = hf_hub_download(
+            repo_id=f"{HF_USERNAME}/{HF_MODEL_REPO}",
+            filename=CHECKPOINT_FILENAME,
+            cache_dir="checkpoints",
+        )
+        print(f"Model downloaded successfully to {downloaded_path}")
+        return downloaded_path
+    except Exception as e:
+        print(f"Error downloading model: {e}")
+        return None
+
+
+def load_checkpoint(model, map_location=None):
+    """Load model checkpoint from file"""
+    # Download or get the checkpoint path
+    checkpoint_path = download_model_from_hub()
+
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}")
+        return None, 0, float("inf")
+
+    # Use torch.load with map_location parameter
+    checkpoint = CPU_Unpickler(open(checkpoint_path, "rb")).load()
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"Checkpoint loaded from {checkpoint_path}")
+    return model, checkpoint.get("epoch", 0), checkpoint.get("loss", float("inf"))
 
 
 def load_tokenizer():

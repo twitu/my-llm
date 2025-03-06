@@ -2,3 +2,4 @@ torch
 transformers
 tiktoken
 gradio
+huggingface-hub
