@@ -26,6 +26,7 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # We keep the bias buffer for compatibility but use Flash Attention when available
         self.register_buffer(
             "bias",
             torch.tril(torch.ones(config.block_size, config.block_size)).view(
@@ -34,33 +35,25 @@ class CausalSelfAttention(nn.Module):
         )
 
     def forward(self, x):
-        B, T, C = (
-            x.size()
-        )  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # Use Flash Attention when available (much faster)
+        if hasattr(F, "scaled_dot_product_attention"):
+            # Use the optimized Flash Attention implementation
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # Fall back to manual implementation
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
 
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-        # output projection
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
 
@@ -225,6 +218,37 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )
+        return optimizer
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -312,14 +336,51 @@ def load_checkpoint(model, optimizer=None, path="checkpoints"):
 def train(
     model,
     train_loader,
-    learning_rate,
+    learning_rate=3e-4,
     target_loss=0.0999,
     max_epochs=1000,
+    weight_decay=0.1,
     resume=False,
 ):
-    """Train the model until target loss is reached or max_epochs is hit"""
+    """Train the model with improved training techniques"""
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    # Set high precision for matmul operations
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    # Setup optimizer with weight decay
+    if hasattr(model, "configure_optimizers"):
+        optimizer = model.configure_optimizers(
+            weight_decay=weight_decay, learning_rate=learning_rate, device_type=device
+        )
+    else:
+        # Fallback to simple optimizer
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=learning_rate, betas=(0.9, 0.95), eps=1e-8
+        )
+
+    # Learning rate scheduler setup
+    max_lr = learning_rate
+    min_lr = max_lr * 0.1
+    warmup_epochs = 5  # Adapt based on your dataset size
+
+    def get_lr(epoch, batch, total_batches):
+        # Convert to iteration space
+        it = epoch * total_batches + batch
+        warmup_iters = warmup_epochs * total_batches
+        max_iters = max_epochs * total_batches
+
+        if it < warmup_iters:
+            return max_lr * (it + 1) / warmup_iters
+        if it > max_iters:
+            return min_lr
+
+        # Apply cosine decay
+        decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+        decay_ratio = min(max(decay_ratio, 0.0), 1.0)  # Safety bounds check
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
 
     start_epoch = 0
     best_loss = float("inf")
@@ -340,7 +401,6 @@ def train(
 
     # Calculate total batches for progress tracking
     total_batches = train_loader.total_batches()
-    batches_per_epoch = total_batches  # Use ALL batches in your dataset
 
     epoch = start_epoch
     current_loss = float("inf")
@@ -350,31 +410,71 @@ def train(
         while epoch < max_epochs and current_loss > target_loss:
             total_loss = 0
             batch_count = 0
+            tokens_per_sec_avg = 0
 
             # Training loop for this epoch
-            with tqdm(
-                total=batches_per_epoch, desc=f"Epoch {epoch} batches"
-            ) as batch_pbar:
-                for i in range(batches_per_epoch):
+            with tqdm(total=total_batches, desc=f"Epoch {epoch} batches") as batch_pbar:
+                for i in range(total_batches):
+                    t0 = time.time()
+
+                    # Get batch
                     x, y = train_loader.next_batch()
                     x, y = x.to(device), y.to(device)
+
+                    # Adjust learning rate
+                    lr = get_lr(epoch, i, total_batches)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
+
+                    # Forward and backward
                     optimizer.zero_grad()
-                    logits, loss = model(x, y)
+
+                    # Use mixed precision when supported
+                    if device == "cuda" and hasattr(torch, "autocast"):
+                        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                            logits, loss = model(x, y)
+                    else:
+                        logits, loss = model(x, y)
+
                     loss.backward()
+
+                    # Apply gradient clipping
+                    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
                     optimizer.step()
+
+                    # Calculate training speed
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                    t1 = time.time()
+                    dt = t1 - t0
+                    tokens_per_sec = (train_loader.B * train_loader.T) / dt
+                    tokens_per_sec_avg = (
+                        0.9 * tokens_per_sec_avg + 0.1 * tokens_per_sec
+                        if batch_count > 0
+                        else tokens_per_sec
+                    )
 
                     total_loss += loss.item()
                     batch_count += 1
 
                     # Update batch progress bar
-                    batch_pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    batch_pbar.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        lr=f"{lr:.1e}",
+                        tok_per_sec=f"{tokens_per_sec:.0f}",
+                    )
                     batch_pbar.update(1)
 
             # Calculate average loss for the epoch
             current_loss = total_loss / batch_count
 
             # Update epoch progress bar
-            epoch_pbar.set_postfix(loss=f"{current_loss:.4f}", best=f"{best_loss:.4f}")
+            epoch_pbar.set_postfix(
+                loss=f"{current_loss:.4f}",
+                best=f"{best_loss:.4f}",
+                tok_per_sec=f"{tokens_per_sec_avg:.0f}",
+            )
             epoch_pbar.update(1)
 
             print(f"Epoch {epoch} completed. Average Loss: {current_loss:.4f}")
@@ -461,9 +561,9 @@ if __name__ == "__main__":
         choices=["train", "generate"],
         help="Mode: train or generate",
     )
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--seq_length", type=int, default=32, help="Sequence length")
+    parser.add_argument("--lr", type=float, default=6e-4, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--seq_length", type=int, default=128, help="Sequence length")
     parser.add_argument(
         "--target_loss", type=float, default=0.0999, help="Target loss to reach"
     )
@@ -472,6 +572,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--resume", action="store_true", help="Resume training from checkpoint"
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.1, help="Weight decay coefficient"
     )
     parser.add_argument(
         "--generate_length", type=int, default=100, help="Length of generated text"
@@ -502,12 +605,22 @@ if __name__ == "__main__":
         # Initialize model
         model = GPT(GPTConfig())
 
-        # Initialize data loader
+        # Add configure_optimizers method to model
+        if not hasattr(model, "configure_optimizers"):
+            model.configure_optimizers = GPT.configure_optimizers.__get__(model)
+
+        # Initialize data loader with larger batch size and context length
         train_loader = DataLoaderLite(B=args.batch_size, T=args.seq_length)
 
-        # Train the model
+        # Train the model with improved training
         train(
-            model, train_loader, args.lr, args.target_loss, args.max_epochs, args.resume
+            model,
+            train_loader,
+            args.lr,
+            args.target_loss,
+            args.max_epochs,
+            args.weight_decay,
+            args.resume,
         )
 
     elif args.mode == "generate":
